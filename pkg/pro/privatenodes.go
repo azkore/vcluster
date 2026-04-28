@@ -45,7 +45,7 @@ var StartKonnectivity = func(ctx *synccontext.ControllerContext) error {
 		return nil
 	}
 
-	// Spike build: do not start the pro konnectivity server. Disable
+	// Proof-of-concept build: do not start the pro konnectivity server. Disable
 	// controlPlane.advanced.konnectivity.server.enabled in the vCluster values.
 	return nil
 }
@@ -204,11 +204,13 @@ func ensureKubernetesEndpoints(ctx *synccontext.SyncContext) error {
 	if err != nil {
 		return fmt.Errorf("invalid controlPlane.endpoint %q: %w", ctx.Config.ControlPlane.Endpoint, err)
 	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// Endpoints require an IP address. For DNS endpoints the service is still
-		// useful for in-cluster env var injection, but this spike leaves endpoint
-		// routing to direct kubelet/controlPlane.endpoint access.
+	ip, ok, err := resolveEndpointIP(host)
+	if err != nil {
+		return err
+	} else if !ok {
+		// Endpoints require an IP address. If DNS is not resolvable yet, keep the
+		// service for in-cluster env var injection and let nodes use the external
+		// controlPlane.endpoint directly.
 		return nil
 	}
 	port, err := strconv.Atoi(portString)
@@ -235,6 +237,27 @@ func ensureKubernetesEndpoints(ctx *synccontext.SyncContext) error {
 		return fmt.Errorf("update default/kubernetes endpoints: %w", err)
 	}
 	return nil
+}
+
+func resolveEndpointIP(host string) (net.IP, bool, error) {
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip.To4() == nil {
+			return nil, false, fmt.Errorf("only IPv4 controlPlane.endpoint addresses are supported by this private nodes proof of concept, got %q", host)
+		}
+		return ip.To4(), true, nil
+	}
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, false, nil
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.To4(), true, nil
+		}
+	}
+	return nil, false, nil
 }
 
 func setKubernetesEndpointSubsets(endpoints *corev1.Endpoints, ip string, port int32) {
