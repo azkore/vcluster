@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/loft-sh/admin-apis/pkg/licenseapi"
 	"github.com/loft-sh/vcluster/pkg/constants"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/command"
 	"github.com/loft-sh/vcluster/pkg/util/servicecidr"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -18,8 +21,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/klog/v2"
 	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"sigs.k8s.io/yaml"
+)
+
+const (
+	konnectivityAgentServiceAccount = "konnectivity-agent"
+	konnectivityAudience            = "system:konnectivity-server"
+	konnectivityAgentPort           = 8091
+)
+
+var (
+	konnectivityDir          = filepath.Join(constants.DataDir, "konnectivity")
+	konnectivityUDSName      = filepath.Join(konnectivityDir, "konnectivity-server.socket")
+	konnectivityEgressConfig = filepath.Join(konnectivityDir, "egress-selector.yaml")
 )
 
 var StartPrivateNodesMode = func(ctx *synccontext.ControllerContext) error {
@@ -37,7 +53,10 @@ var StartPrivateNodesMode = func(ctx *synccontext.ControllerContext) error {
 	if err := ensureBootstrapRBAC(ctx); err != nil {
 		return err
 	}
-	return ensureKubeProxyRBAC(ctx)
+	if err := ensureKubeProxyRBAC(ctx); err != nil {
+		return err
+	}
+	return ensureKonnectivityAgent(ctx)
 }
 
 var SyncKubernetesServiceDedicated = func(ctx *synccontext.SyncContext) error {
@@ -54,9 +73,40 @@ var StartKonnectivity = func(ctx *synccontext.ControllerContext) error {
 	if !ctx.Config.PrivateNodes.Enabled {
 		return nil
 	}
+	if !ctx.Config.ControlPlane.Advanced.Konnectivity.Server.Enabled {
+		return nil
+	}
 
-	// Proof-of-concept build: do not start the pro konnectivity server. Disable
-	// controlPlane.advanced.konnectivity.server.enabled in the vCluster values.
+	if err := os.MkdirAll(konnectivityDir, 0755); err != nil {
+		return fmt.Errorf("create konnectivity dir: %w", err)
+	}
+
+	args := []string{
+		filepath.Join(constants.BinariesDir, "konnectivity-server"),
+		"--mode=grpc",
+		"--server-port=0",
+		"--uds-name=" + konnectivityUDSName,
+		"--delete-existing-uds-file=true",
+		"--agent-bind-address=0.0.0.0",
+		"--agent-port=" + strconv.Itoa(konnectivityAgentPort),
+		"--health-port=8092",
+		"--admin-port=8095",
+		"--proxy-strategies=default,destHost",
+		"--server-count=1",
+		"--kubeconfig=" + constants.AdminKubeConfig,
+		"--agent-namespace=" + metav1.NamespaceSystem,
+		"--agent-service-account=" + konnectivityAgentServiceAccount,
+		"--authentication-audience=" + konnectivityAudience,
+		"--logtostderr=true",
+	}
+	args = command.MergeArgs(args, ctx.Config.ControlPlane.Advanced.Konnectivity.Server.ExtraArgs)
+
+	go func() {
+		if err := command.RunCommand(ctx, args, "konnectivity-server"); err != nil {
+			klog.ErrorS(err, "Konnectivity server exited")
+		}
+	}()
+
 	return nil
 }
 
@@ -65,7 +115,37 @@ var WithKonnectivity = func(ctx *synccontext.ControllerContext, handler http.Han
 }
 
 var WriteKonnectivityEgressConfig = func() (string, error) {
-	return "", NewFeatureError(licenseapi.VirtualClusterProDistroPrivateNodes)
+	if err := os.MkdirAll(konnectivityDir, 0755); err != nil {
+		return "", fmt.Errorf("create konnectivity dir: %w", err)
+	}
+
+	egressConfig := map[string]interface{}{
+		"apiVersion": "apiserver.k8s.io/v1beta1",
+		"kind":       "EgressSelectorConfiguration",
+		"egressSelections": []map[string]interface{}{
+			{
+				"name": "cluster",
+				"connection": map[string]interface{}{
+					"proxyProtocol": "GRPC",
+					"transport": map[string]interface{}{
+						"uds": map[string]string{
+							"udsName": konnectivityUDSName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	rawEgressConfig, err := yaml.Marshal(egressConfig)
+	if err != nil {
+		return "", fmt.Errorf("marshal konnectivity egress config: %w", err)
+	}
+	if err := os.WriteFile(konnectivityEgressConfig, rawEgressConfig, 0644); err != nil {
+		return "", fmt.Errorf("write konnectivity egress config: %w", err)
+	}
+
+	return konnectivityEgressConfig, nil
 }
 
 type UpgradeOptions struct {
@@ -283,16 +363,8 @@ func ensureKubeProxyRBAC(ctx *synccontext.ControllerContext) error {
 		return fmt.Errorf("virtual manager is nil")
 	}
 
-	serviceAccount := &corev1.ServiceAccount{}
-	key := types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: "kube-proxy"}
-	err := ctx.VirtualManager.GetClient().Get(ctx, key, serviceAccount)
-	if apierrors.IsNotFound(err) {
-		serviceAccount = &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
-		if err := ctx.VirtualManager.GetClient().Create(ctx, serviceAccount); err != nil {
-			return fmt.Errorf("create kube-proxy serviceaccount: %w", err)
-		}
-	} else if err != nil {
-		return fmt.Errorf("get kube-proxy serviceaccount: %w", err)
+	if err := ensureServiceAccount(ctx, metav1.NamespaceSystem, "kube-proxy"); err != nil {
+		return err
 	}
 
 	return ensureClusterRoleBinding(ctx, "vcluster-private-nodes-kube-proxy", rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "system:node-proxier"}, []rbacv1.Subject{{
@@ -300,6 +372,31 @@ func ensureKubeProxyRBAC(ctx *synccontext.ControllerContext) error {
 		Name:      "kube-proxy",
 		Namespace: metav1.NamespaceSystem,
 	}})
+}
+
+func ensureKonnectivityAgent(ctx *synccontext.ControllerContext) error {
+	if ctx.VirtualManager == nil {
+		return fmt.Errorf("virtual manager is nil")
+	}
+
+	return ensureServiceAccount(ctx, metav1.NamespaceSystem, konnectivityAgentServiceAccount)
+}
+
+func ensureServiceAccount(ctx *synccontext.ControllerContext, namespace, name string) error {
+	serviceAccount := &corev1.ServiceAccount{}
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, serviceAccount)
+	if apierrors.IsNotFound(err) {
+		serviceAccount = &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, serviceAccount); err != nil {
+			return fmt.Errorf("create %s/%s serviceaccount: %w", namespace, name, err)
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get %s/%s serviceaccount: %w", namespace, name, err)
+	}
+	return nil
 }
 
 func ensureConfigMap(ctx *synccontext.ControllerContext, namespace, name string, data map[string]string) error {
