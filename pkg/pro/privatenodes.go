@@ -2,6 +2,8 @@ package pro
 
 import (
 	"context"
+	"crypto"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"github.com/loft-sh/admin-apis/pkg/licenseapi"
 	"github.com/loft-sh/vcluster/pkg/constants"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/certhelper"
 	"github.com/loft-sh/vcluster/pkg/util/command"
 	"github.com/loft-sh/vcluster/pkg/util/servicecidr"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +39,8 @@ var (
 	konnectivityDir          = filepath.Join(constants.DataDir, "konnectivity")
 	konnectivityUDSName      = filepath.Join(konnectivityDir, "konnectivity-server.socket")
 	konnectivityEgressConfig = filepath.Join(konnectivityDir, "egress-selector.yaml")
+	konnectivityServingCert  = filepath.Join(konnectivityDir, "agent-server.crt")
+	konnectivityServingKey   = filepath.Join(konnectivityDir, "agent-server.key")
 )
 
 var StartPrivateNodesMode = func(ctx *synccontext.ControllerContext) error {
@@ -80,6 +85,9 @@ var StartKonnectivity = func(ctx *synccontext.ControllerContext) error {
 	if err := os.MkdirAll(konnectivityDir, 0755); err != nil {
 		return fmt.Errorf("create konnectivity dir: %w", err)
 	}
+	if err := ensureKonnectivityServingCert(ctx); err != nil {
+		return err
+	}
 
 	args := []string{
 		filepath.Join(constants.BinariesDir, "konnectivity-server"),
@@ -89,8 +97,8 @@ var StartKonnectivity = func(ctx *synccontext.ControllerContext) error {
 		"--delete-existing-uds-file=true",
 		"--agent-bind-address=0.0.0.0",
 		"--agent-port=" + strconv.Itoa(konnectivityAgentPort),
-		"--cluster-cert=" + constants.APIServerCert,
-		"--cluster-key=" + constants.APIServerKey,
+		"--cluster-cert=" + konnectivityServingCert,
+		"--cluster-key=" + konnectivityServingKey,
 		"--health-port=8092",
 		"--admin-port=8095",
 		"--proxy-strategies=default,destHost",
@@ -382,6 +390,69 @@ func ensureKonnectivityAgent(ctx *synccontext.ControllerContext) error {
 	}
 
 	return ensureServiceAccount(ctx, metav1.NamespaceSystem, konnectivityAgentServiceAccount)
+}
+
+func ensureKonnectivityServingCert(ctx *synccontext.ControllerContext) error {
+	caCertBytes, err := os.ReadFile(constants.ServerCACert)
+	if err != nil {
+		return fmt.Errorf("read konnectivity server ca cert: %w", err)
+	}
+	caCerts, err := certhelper.ParseCertsPEM(caCertBytes)
+	if err != nil {
+		return fmt.Errorf("parse konnectivity server ca cert: %w", err)
+	}
+	caKeyBytes, err := os.ReadFile(constants.ServerCAKey)
+	if err != nil {
+		return fmt.Errorf("read konnectivity server ca key: %w", err)
+	}
+	caKey, err := certhelper.ParsePrivateKeyPEM(caKeyBytes)
+	if err != nil {
+		return fmt.Errorf("parse konnectivity server ca key: %w", err)
+	}
+
+	privateKey, err := certhelper.MakeEllipticPrivateKeyPEM()
+	if err != nil {
+		return fmt.Errorf("generate konnectivity serving key: %w", err)
+	}
+	key, err := certhelper.ParsePrivateKeyPEM(privateKey)
+	if err != nil {
+		return fmt.Errorf("parse generated konnectivity serving key: %w", err)
+	}
+
+	dnsNames := []string{
+		"konnectivity",
+		"konnectivity.kube-system",
+		"konnectivity.kube-system.svc",
+		"konnectivity.kube-system.svc." + ctx.Config.Networking.Advanced.ClusterDomain,
+		ctx.Config.Name,
+	}
+	if ctx.Config.ControlPlane.Endpoint != "" {
+		host, _, err := net.SplitHostPort(ctx.Config.ControlPlane.Endpoint)
+		if err != nil {
+			return fmt.Errorf("parse controlPlane.endpoint for konnectivity cert: %w", err)
+		}
+		dnsNames = append(dnsNames, host)
+	}
+
+	cert, err := certhelper.NewSignedCert(certhelper.Config{
+		CommonName: "konnectivity",
+		AltNames: certhelper.AltNames{
+			DNSNames: dnsNames,
+		},
+		Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, key.(crypto.Signer), caCerts[0], caKey.(crypto.Signer))
+	if err != nil {
+		return fmt.Errorf("generate konnectivity serving cert: %w", err)
+	}
+
+	certBytes := append(certhelper.EncodeCertPEM(cert), certhelper.EncodeCertPEM(caCerts[0])...)
+	if err := os.WriteFile(konnectivityServingCert, certBytes, 0644); err != nil {
+		return fmt.Errorf("write konnectivity serving cert: %w", err)
+	}
+	if err := os.WriteFile(konnectivityServingKey, privateKey, 0600); err != nil {
+		return fmt.Errorf("write konnectivity serving key: %w", err)
+	}
+	return nil
 }
 
 func ensureServiceAccount(ctx *synccontext.ControllerContext, namespace, name string) error {
