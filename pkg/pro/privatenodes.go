@@ -13,6 +13,7 @@ import (
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/servicecidr"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,7 +28,16 @@ var StartPrivateNodesMode = func(ctx *synccontext.ControllerContext) error {
 		return nil
 	}
 
-	return ensureKubeadmConfig(ctx)
+	if err := ensureKubeadmConfig(ctx); err != nil {
+		return err
+	}
+	if err := ensureKubeletConfig(ctx); err != nil {
+		return err
+	}
+	if err := ensureBootstrapRBAC(ctx); err != nil {
+		return err
+	}
+	return ensureKubeProxyRBAC(ctx)
 }
 
 var SyncKubernetesServiceDedicated = func(ctx *synccontext.SyncContext) error {
@@ -145,6 +155,274 @@ func ensureKubeadmConfig(ctx *synccontext.ControllerContext) error {
 	configMap.Data["ClusterConfiguration"] = string(rawClusterConfiguration)
 	if err := ctx.VirtualManager.GetClient().Update(ctx, configMap); err != nil {
 		return fmt.Errorf("update kubeadm-config configmap: %w", err)
+	}
+	return nil
+}
+
+func ensureKubeletConfig(ctx *synccontext.ControllerContext) error {
+	if ctx.VirtualManager == nil {
+		return fmt.Errorf("virtual manager is nil")
+	}
+
+	serviceCIDR, err := servicecidr.GetServiceCIDR(ctx, &ctx.Config.Config, ctx.Config.HostClient, ctx.Config.Name, ctx.Config.HostNamespace)
+	if err != nil {
+		return fmt.Errorf("get service cidr: %w", err)
+	}
+	clusterDNS, err := serviceIPWithOffset(serviceCIDR, 10)
+	if err != nil {
+		return fmt.Errorf("derive cluster dns service ip: %w", err)
+	}
+
+	clusterDomain := ctx.Config.Networking.Advanced.ClusterDomain
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local"
+	}
+
+	kubeletConfiguration := map[string]interface{}{
+		"apiVersion": "kubelet.config.k8s.io/v1beta1",
+		"kind":       "KubeletConfiguration",
+		"authentication": map[string]interface{}{
+			"anonymous": map[string]bool{"enabled": false},
+			"webhook": map[string]interface{}{
+				"enabled":  true,
+				"cacheTTL": "0s",
+			},
+			"x509": map[string]string{"clientCAFile": "/etc/kubernetes/pki/ca.crt"},
+		},
+		"authorization": map[string]interface{}{
+			"mode": "Webhook",
+			"webhook": map[string]string{
+				"cacheAuthorizedTTL":   "0s",
+				"cacheUnauthorizedTTL": "0s",
+			},
+		},
+		"cgroupDriver":       "systemd",
+		"clusterDNS":         []string{clusterDNS},
+		"clusterDomain":      clusterDomain,
+		"failSwapOn":         false,
+		"healthzBindAddress": "127.0.0.1",
+		"healthzPort":        int32(10248),
+		"memorySwap":         map[string]interface{}{},
+		"rotateCertificates": true,
+		"staticPodPath":      "/etc/kubernetes/manifests",
+	}
+	rawKubeletConfiguration, err := yaml.Marshal(kubeletConfiguration)
+	if err != nil {
+		return fmt.Errorf("marshal kubelet configuration: %w", err)
+	}
+
+	return ensureConfigMap(ctx, metav1.NamespaceSystem, kubeadmconstants.KubeletBaseConfigurationConfigMap, map[string]string{
+		kubeadmconstants.KubeletBaseConfigurationConfigMapKey: string(rawKubeletConfiguration),
+	})
+}
+
+func ensureBootstrapRBAC(ctx *synccontext.ControllerContext) error {
+	if ctx.VirtualManager == nil {
+		return fmt.Errorf("virtual manager is nil")
+	}
+
+	bootstrapSubjects := []rbacv1.Subject{
+		{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:bootstrappers"},
+		{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: kubeadmconstants.NodeBootstrapTokenAuthGroup},
+	}
+
+	if err := ensureRole(ctx, metav1.NamespaceSystem, "vcluster-private-nodes-bootstrap-config-reader", []rbacv1.PolicyRule{{
+		APIGroups:     []string{""},
+		Resources:     []string{"configmaps"},
+		ResourceNames: []string{kubeadmconstants.KubeadmConfigConfigMap, kubeadmconstants.KubeletBaseConfigurationConfigMap, kubeadmconstants.KubeProxyConfigMap},
+		Verbs:         []string{"get"},
+	}}); err != nil {
+		return err
+	}
+	if err := ensureRoleBinding(ctx, metav1.NamespaceSystem, "vcluster-private-nodes-bootstrap-config-reader", rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "Role", Name: "vcluster-private-nodes-bootstrap-config-reader"}, bootstrapSubjects); err != nil {
+		return err
+	}
+
+	if err := ensureClusterRole(ctx, "vcluster-private-nodes-bootstrap-node-reader", []rbacv1.PolicyRule{{
+		APIGroups: []string{""},
+		Resources: []string{"nodes"},
+		Verbs:     []string{"get"},
+	}}); err != nil {
+		return err
+	}
+	if err := ensureClusterRoleBinding(ctx, "vcluster-private-nodes-bootstrap-node-reader", rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "vcluster-private-nodes-bootstrap-node-reader"}, bootstrapSubjects); err != nil {
+		return err
+	}
+
+	for _, binding := range []struct {
+		name     string
+		roleName string
+		subjects []rbacv1.Subject
+	}{
+		{
+			name:     "vcluster-private-nodes-create-csrs-for-bootstrapping",
+			roleName: "system:node-bootstrapper",
+			subjects: bootstrapSubjects,
+		},
+		{
+			name:     "vcluster-private-nodes-auto-approve-csrs-for-bootstrappers",
+			roleName: "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+			subjects: bootstrapSubjects,
+		},
+		{
+			name:     "vcluster-private-nodes-auto-approve-renewals-for-nodes",
+			roleName: "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+			subjects: []rbacv1.Subject{{Kind: rbacv1.GroupKind, APIGroup: rbacv1.GroupName, Name: "system:nodes"}},
+		},
+	} {
+		if err := ensureClusterRoleBinding(ctx, binding.name, rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: binding.roleName}, binding.subjects); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ensureKubeProxyRBAC(ctx *synccontext.ControllerContext) error {
+	if ctx.VirtualManager == nil {
+		return fmt.Errorf("virtual manager is nil")
+	}
+
+	serviceAccount := &corev1.ServiceAccount{}
+	key := types.NamespacedName{Namespace: metav1.NamespaceSystem, Name: "kube-proxy"}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, serviceAccount)
+	if apierrors.IsNotFound(err) {
+		serviceAccount = &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, serviceAccount); err != nil {
+			return fmt.Errorf("create kube-proxy serviceaccount: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("get kube-proxy serviceaccount: %w", err)
+	}
+
+	return ensureClusterRoleBinding(ctx, "vcluster-private-nodes-kube-proxy", rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "system:node-proxier"}, []rbacv1.Subject{{
+		Kind:      rbacv1.ServiceAccountKind,
+		Name:      "kube-proxy",
+		Namespace: metav1.NamespaceSystem,
+	}})
+}
+
+func ensureConfigMap(ctx *synccontext.ControllerContext, namespace, name string, data map[string]string) error {
+	configMap := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, configMap)
+	if apierrors.IsNotFound(err) {
+		configMap = &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}, Data: data}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, configMap); err != nil {
+			return fmt.Errorf("create %s/%s configmap: %w", namespace, name, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get %s/%s configmap: %w", namespace, name, err)
+	}
+
+	configMap.Data = data
+	if err := ctx.VirtualManager.GetClient().Update(ctx, configMap); err != nil {
+		return fmt.Errorf("update %s/%s configmap: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func ensureRole(ctx *synccontext.ControllerContext, namespace, name string, rules []rbacv1.PolicyRule) error {
+	role := &rbacv1.Role{}
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, role)
+	if apierrors.IsNotFound(err) {
+		role = &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}, Rules: rules}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, role); err != nil {
+			return fmt.Errorf("create %s/%s role: %w", namespace, name, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get %s/%s role: %w", namespace, name, err)
+	}
+
+	role.Rules = rules
+	if err := ctx.VirtualManager.GetClient().Update(ctx, role); err != nil {
+		return fmt.Errorf("update %s/%s role: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func ensureRoleBinding(ctx *synccontext.ControllerContext, namespace, name string, roleRef rbacv1.RoleRef, subjects []rbacv1.Subject) error {
+	roleBinding := &rbacv1.RoleBinding{}
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, roleBinding)
+	if apierrors.IsNotFound(err) {
+		roleBinding = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}, RoleRef: roleRef, Subjects: subjects}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, roleBinding); err != nil {
+			return fmt.Errorf("create %s/%s rolebinding: %w", namespace, name, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get %s/%s rolebinding: %w", namespace, name, err)
+	}
+
+	roleBinding.Subjects = subjects
+	if roleBinding.RoleRef != roleRef {
+		if err := ctx.VirtualManager.GetClient().Delete(ctx, roleBinding); err != nil {
+			return fmt.Errorf("delete %s/%s rolebinding with immutable roleRef: %w", namespace, name, err)
+		}
+		roleBinding = &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}, RoleRef: roleRef, Subjects: subjects}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, roleBinding); err != nil {
+			return fmt.Errorf("recreate %s/%s rolebinding: %w", namespace, name, err)
+		}
+		return nil
+	}
+	if err := ctx.VirtualManager.GetClient().Update(ctx, roleBinding); err != nil {
+		return fmt.Errorf("update %s/%s rolebinding: %w", namespace, name, err)
+	}
+	return nil
+}
+
+func ensureClusterRole(ctx *synccontext.ControllerContext, name string, rules []rbacv1.PolicyRule) error {
+	clusterRole := &rbacv1.ClusterRole{}
+	key := types.NamespacedName{Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, clusterRole)
+	if apierrors.IsNotFound(err) {
+		clusterRole = &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: key.Name}, Rules: rules}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, clusterRole); err != nil {
+			return fmt.Errorf("create %s clusterrole: %w", name, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get %s clusterrole: %w", name, err)
+	}
+
+	clusterRole.Rules = rules
+	if err := ctx.VirtualManager.GetClient().Update(ctx, clusterRole); err != nil {
+		return fmt.Errorf("update %s clusterrole: %w", name, err)
+	}
+	return nil
+}
+
+func ensureClusterRoleBinding(ctx *synccontext.ControllerContext, name string, roleRef rbacv1.RoleRef, subjects []rbacv1.Subject) error {
+	clusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+	key := types.NamespacedName{Name: name}
+	err := ctx.VirtualManager.GetClient().Get(ctx, key, clusterRoleBinding)
+	if apierrors.IsNotFound(err) {
+		clusterRoleBinding = &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: key.Name}, RoleRef: roleRef, Subjects: subjects}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, clusterRoleBinding); err != nil {
+			return fmt.Errorf("create %s clusterrolebinding: %w", name, err)
+		}
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("get %s clusterrolebinding: %w", name, err)
+	}
+
+	clusterRoleBinding.Subjects = subjects
+	if clusterRoleBinding.RoleRef != roleRef {
+		if err := ctx.VirtualManager.GetClient().Delete(ctx, clusterRoleBinding); err != nil {
+			return fmt.Errorf("delete %s clusterrolebinding with immutable roleRef: %w", name, err)
+		}
+		clusterRoleBinding = &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: key.Name}, RoleRef: roleRef, Subjects: subjects}
+		if err := ctx.VirtualManager.GetClient().Create(ctx, clusterRoleBinding); err != nil {
+			return fmt.Errorf("recreate %s clusterrolebinding: %w", name, err)
+		}
+		return nil
+	}
+	if err := ctx.VirtualManager.GetClient().Update(ctx, clusterRoleBinding); err != nil {
+		return fmt.Errorf("update %s clusterrolebinding: %w", name, err)
 	}
 	return nil
 }
@@ -272,18 +550,22 @@ func setKubernetesEndpointSubsets(endpoints *corev1.Endpoints, ip string, port i
 }
 
 func firstServiceIP(cidr string) (string, error) {
+	return serviceIPWithOffset(cidr, 1)
+}
+
+func serviceIPWithOffset(cidr string, offset byte) (string, error) {
 	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
 		return "", fmt.Errorf("parse service cidr %q: %w", cidr, err)
 	}
 	if ip.To4() == nil {
-		return "", fmt.Errorf("only IPv4 service CIDRs are supported by this private nodes spike, got %q", cidr)
+		return "", fmt.Errorf("only IPv4 service CIDRs are supported by this private nodes proof of concept, got %q", cidr)
 	}
 
 	serviceIP := append(net.IP(nil), ip.To4()...)
-	serviceIP[3]++
+	serviceIP[3] += offset
 	if !ipNet.Contains(serviceIP) || strings.EqualFold(serviceIP.String(), ip.String()) {
-		return "", fmt.Errorf("could not derive first service IP from %q", cidr)
+		return "", fmt.Errorf("could not derive service IP offset %d from %q", offset, cidr)
 	}
 	return serviceIP.String(), nil
 }
