@@ -61,6 +61,9 @@ var StartPrivateNodesMode = func(ctx *synccontext.ControllerContext) error {
 	if err := ensureKubeProxyRBAC(ctx); err != nil {
 		return err
 	}
+	if err := ensureKubeletAPIAdminRBAC(ctx); err != nil {
+		return err
+	}
 	return ensureKonnectivityAgent(ctx)
 }
 
@@ -381,6 +384,14 @@ func ensureKubeProxyRBAC(ctx *synccontext.ControllerContext) error {
 		Kind:      rbacv1.ServiceAccountKind,
 		Name:      "kube-proxy",
 		Namespace: metav1.NamespaceSystem,
+	}})
+}
+
+func ensureKubeletAPIAdminRBAC(ctx *synccontext.ControllerContext) error {
+	return ensureClusterRoleBinding(ctx, "vcluster-private-nodes-kubelet-api-admin", rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "system:kubelet-api-admin"}, []rbacv1.Subject{{
+		Kind:     rbacv1.UserKind,
+		APIGroup: rbacv1.GroupName,
+		Name:     "kube-apiserver-kubelet-client",
 	}})
 }
 
