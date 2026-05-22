@@ -1,0 +1,19 @@
+#cloud-config
+# Example cloud-init for fresh external Ubuntu nodes.
+# Replace the SSH public key before use. Do not commit private keys.
+users:
+  - default
+  - name: ubuntu
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 REPLACE_WITH_OPERATOR_PUBLIC_KEY vcluster-private-nodes-repro
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - tar
+  - gzip
+  - jq
+  - socat
