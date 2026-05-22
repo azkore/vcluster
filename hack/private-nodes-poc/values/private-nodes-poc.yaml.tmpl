@@ -1,0 +1,65 @@
+# Helm values for the patched OSS vCluster Private Nodes PoC.
+#
+# Render this template with scripts/install-private-nodes-poc.sh. The
+# endpoint must be the externally reachable vCluster API host:port that fresh
+# nodes will use for kubeadm discovery and Konnectivity.
+
+sync:
+  toHost:
+    pods:
+      enabled: false
+  fromHost:
+    nodes:
+      enabled: true
+
+controlPlane:
+  endpoint: "__VCLUSTER_ENDPOINT__"
+
+  statefulSet:
+    image:
+      registry: docker.io
+      repository: azcore/vcluster
+      tag: private-nodes-poc-072e8c2
+
+  distro:
+    k8s:
+      enabled: true
+      image:
+        registry: ghcr.io
+        repository: loft-sh/kubernetes
+        tag: v1.35.0
+      apiServer:
+        extraArgs:
+          - --service-account-jwks-uri=https://kubernetes.default.svc.cluster.local/openid/v1/jwks
+      scheduler:
+        enabled: true
+
+  coredns:
+    service:
+      spec:
+        type: ClusterIP
+        clusterIP: 10.96.0.10
+
+  service:
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: "__VCLUSTER_ENDPOINT_HOST__"
+    spec:
+      type: LoadBalancer
+      ports:
+        - name: https
+          port: 443
+          targetPort: 8443
+          protocol: TCP
+        - name: konnectivity
+          port: 8091
+          targetPort: 8091
+          protocol: TCP
+
+networking:
+  podCIDR: 10.244.0.0/16
+  serviceCIDR: 10.96.0.0/12
+  advanced:
+    clusterDomain: cluster.local
+
+privateNodes:
+  enabled: true
